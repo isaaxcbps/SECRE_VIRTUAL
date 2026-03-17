@@ -8,7 +8,7 @@ import time
 import requests
 import asyncio
 from email.mime.text import MIMEText
-from fastapi import FastAPI, HTTPException, Form 
+from fastapi import FastAPI, Form 
 import google.generativeai as genai
 from dotenv import load_dotenv
 from twilio.rest import Client
@@ -21,7 +21,7 @@ load_dotenv()
 # IA (Gemini)
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 model = genai.GenerativeModel(
-    'gemini-2.5-flash', # O la versión que estés usando
+    'gemini-2.5-flash', 
     generation_config={"response_mime_type": "application/json"}
 )
 
@@ -37,14 +37,15 @@ TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_NUMBER = os.getenv("TWILIO_NUMBER")
 MI_NUMERO_CELULAR = os.getenv("MI_NUMERO_CELULAR")
 
+# 🚨 AQUÍ ESTÁ LA CORRECCIÓN PARA EL ERROR DE RED DE RENDER
 SERVERS = {
     "gmail": {"imap": "imap.gmail.com", "smtp": "smtp.gmail.com"},
-    "outlook": {"imap": "imap-mail.outlook.com", "smtp": "smtp-mail.outlook.com"}
+    "outlook": {"imap": "outlook.office365.com", "smtp": "smtp.office365.com"}
 }
 
-# Inicializar FastAPI con fix para rutas
+# Inicializar FastAPI con fix para evitar el 404
 app = FastAPI(
-    title="Secretaria Virtual Norman",
+    title="Secretaria Virtual",
     redirect_slashes=False 
 )
 
@@ -69,19 +70,23 @@ def enviar_respuesta_smtp(destinatario: str, asunto: str, cuerpo: str):
     """Envía el correo final una vez aprobado."""
     try:
         smtp_server = SERVERS[EMAIL_PROVIDER]["smtp"]
+        print(f"📧 Conectando al servidor postal: {smtp_server}...")
+        
         msg = MIMEText(cuerpo)
         msg['Subject'] = f"Re: {asunto}"
         msg['From'] = EMAIL_ACCOUNT
         msg['To'] = destinatario
 
-        with smtplib.SMTP(smtp_server, 587) as server:
+        # Agregamos timeout=15 para evitar que Render aborte la conexión
+        with smtplib.SMTP(smtp_server, 587, timeout=15) as server:
             server.starttls()
             server.login(EMAIL_ACCOUNT, EMAIL_PASSWORD)
             server.send_message(msg)
-        print(f"✅ Correo enviado exitosamente a {destinatario}")
+            
+        print(f"✅ ¡ÉXITO! Correo enviado exitosamente a {destinatario}")
         return True
     except Exception as e:
-        print(f"❌ Error SMTP: {e}")
+        print(f"❌ Error SMTP detallado: {e}")
         return False
 
 def guardar_correo_pendiente(remitente: str, asunto: str, borrador: str):
@@ -120,24 +125,23 @@ def enviar_alerta_whatsapp(remitente: str, asunto: str, cuerpo: str, borrador: s
 
 @app.get("/")
 def home():
-    return {"mensaje": "Secretaria Virtual v2.5 en línea"}
+    return {"mensaje": "Secretaria Virtual en línea"}
 
 @app.get("/test")
 def test_ruta():
-    return {"mensaje": "Si ves esto, el Webhook debería funcionar!"}
+    return {"mensaje": "Si ves esto, Render está actualizado y listo!"}
 
 @app.post("/webhook-whatsapp")
 @app.post("/webhook-whatsapp/")
 async def recibir_whatsapp(Body: str = Form(...), From: str = Form(...)):
     """Escucha tu 'SÍ' o 'NO' desde WhatsApp."""
     orden = Body.strip().lower()
-    print(f"📩 Webhook recibió: {orden}")
+    print(f"\n📩 Webhook recibió: '{orden}' desde el celular")
     
     url_db = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/d1/database/{CF_DATABASE_ID}/query"
     headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"}
 
     if orden in ["si", "sí", "yes", "ok"]:
-        # Buscar el último pendiente en BD
         p_select = {"sql": "SELECT id, remitente, asunto, borrador_ia FROM correos_pendientes WHERE estado = 'PENDIENTE' ORDER BY id DESC LIMIT 1"}
         res = requests.post(url_db, headers=headers, json=p_select).json()
         
@@ -145,13 +149,16 @@ async def recibir_whatsapp(Body: str = Form(...), From: str = Form(...)):
             results = res.get("result", [{}])[0].get("results", [])
             if results:
                 correo = results[0]
-                # 1. Enviar el correo de verdad
+                print(f"⏳ Aprobado. Procesando envío a {correo['remitente']}...")
+                
+                # 1. Enviar el correo de verdad (Aquí es donde brillará la corrección)
                 enviado = enviar_respuesta_smtp(correo["remitente"], correo["asunto"], correo["borrador_ia"])
+                
                 if enviado:
                     # 2. Marcar como enviado en BD
                     p_update = {"sql": "UPDATE correos_pendientes SET estado = 'ENVIADO' WHERE id = ?", "params": [correo["id"]]}
                     requests.post(url_db, headers=headers, json=p_update)
-                    print("✅ Proceso completado: Correo enviado y BD actualizada.")
+                    print("💾 Base de datos actualizada a ENVIADO.")
             else:
                 print("⚠️ No hay correos pendientes.")
         except Exception as e:
@@ -182,7 +189,6 @@ async def ejecutar_secretaria():
             if isinstance(asunto, bytes): asunto = asunto.decode()
             remitente = msg.get('From')
             
-            # Obtener cuerpo
             cuerpo = ""
             if msg.is_multipart():
                 for part in msg.walk():
@@ -191,7 +197,6 @@ async def ejecutar_secretaria():
             else:
                 cuerpo = msg.get_payload(decode=True).decode(errors='ignore')
 
-            # IA
             prompt = f"{SYSTEM_PROMPT}\n\nDe: {remitente}\nAsunto: {asunto}\nCuerpo:\n{cuerpo}"
             raw_ia = model.generate_content(prompt)
             analisis = json.loads(raw_ia.text)
@@ -211,9 +216,9 @@ async def ejecutar_secretaria():
 
 async def revision_automatica():
     while True:
+        await asyncio.sleep(300) # Espera inicial
         print("\n⏳ [CRON] Revisando correos...")
         await ejecutar_secretaria()
-        await asyncio.sleep(300)
 
 @app.on_event("startup")
 async def iniciar_cron():
