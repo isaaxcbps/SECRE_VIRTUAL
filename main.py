@@ -1,13 +1,11 @@
 import os
 import json
 import imaplib
-import smtplib
 import email
 import datetime
 import time
 import requests
 import asyncio
-from email.mime.text import MIMEText
 from fastapi import FastAPI, Form 
 import google.generativeai as genai
 from dotenv import load_dotenv
@@ -25,7 +23,7 @@ model = genai.GenerativeModel(
     generation_config={"response_mime_type": "application/json"}
 )
 
-# Credenciales
+# Credenciales y Variables
 EMAIL_ACCOUNT = os.getenv("EMAIL_ACCOUNT")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 EMAIL_PROVIDER = os.getenv("EMAIL_PROVIDER", "outlook").lower()
@@ -37,10 +35,13 @@ TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_NUMBER = os.getenv("TWILIO_NUMBER")
 MI_NUMERO_CELULAR = os.getenv("MI_NUMERO_CELULAR")
 
-# 🚨 AQUÍ ESTÁ LA CORRECCIÓN PARA EL ERROR DE RED DE RENDER
+# 🚨 NUEVA LLAVE PARA EL PUENTE DE GOOGLE
+GOOGLE_SCRIPT_URL = os.getenv("GOOGLE_SCRIPT_URL")
+
+# Servidores IMAP (Solo para LEER los correos, ya no usamos SMTP aquí)
 SERVERS = {
-    "gmail": {"imap": "imap.gmail.com", "smtp": "smtp.gmail.com"},
-    "outlook": {"imap": "outlook.office365.com", "smtp": "smtp.office365.com"}
+    "gmail": {"imap": "imap.gmail.com"},
+    "outlook": {"imap": "outlook.office365.com"}
 }
 
 # Inicializar FastAPI con fix para evitar el 404
@@ -63,30 +64,32 @@ Eres una secretaria virtual experta. Analiza el correo y devuelve un JSON:
 """
 
 # ==========================================
-# 2. FUNCIONES DE APOYO (SMTP, BD, TWILIO)
+# 2. FUNCIONES DE APOYO (HTTP, BD, TWILIO)
 # ==========================================
 
 def enviar_respuesta_smtp(destinatario: str, asunto: str, cuerpo: str):
-    """Envía el correo final una vez aprobado."""
+    """Envía el correo saltando el bloqueo de Render mediante un Webhook de Google."""
     try:
-        smtp_server = SERVERS[EMAIL_PROVIDER]["smtp"]
-        print(f"📧 Conectando al servidor postal: {smtp_server}...")
+        print("🚀 Enviando correo vía HTTP a Google Apps Script...")
         
-        msg = MIMEText(cuerpo)
-        msg['Subject'] = f"Re: {asunto}"
-        msg['From'] = EMAIL_ACCOUNT
-        msg['To'] = destinatario
-
-        # Agregamos timeout=15 para evitar que Render aborte la conexión
-        with smtplib.SMTP(smtp_server, 587, timeout=15) as server:
-            server.starttls()
-            server.login(EMAIL_ACCOUNT, EMAIL_PASSWORD)
-            server.send_message(msg)
+        payload = {
+            "destinatario": destinatario,
+            "asunto": asunto,
+            "cuerpo": cuerpo
+        }
+        
+        # Enviamos los datos por el puerto 443 (HTTP) que Render SÍ permite
+        res = requests.post(GOOGLE_SCRIPT_URL, json=payload)
+        
+        if res.status_code == 200:
+            print(f"✅ ¡ÉXITO TOTAL! Correo enviado exitosamente a {destinatario}")
+            return True
+        else:
+            print(f"❌ Error en el puente de Google: {res.text}")
+            return False
             
-        print(f"✅ ¡ÉXITO! Correo enviado exitosamente a {destinatario}")
-        return True
     except Exception as e:
-        print(f"❌ Error SMTP detallado: {e}")
+        print(f"❌ Error de conexión HTTP: {e}")
         return False
 
 def guardar_correo_pendiente(remitente: str, asunto: str, borrador: str):
@@ -125,7 +128,7 @@ def enviar_alerta_whatsapp(remitente: str, asunto: str, cuerpo: str, borrador: s
 
 @app.get("/")
 def home():
-    return {"mensaje": "Secretaria Virtual en línea"}
+    return {"mensaje": "Secretaria Virtual en línea y usando Google Bridge"}
 
 @app.get("/test")
 def test_ruta():
@@ -151,7 +154,7 @@ async def recibir_whatsapp(Body: str = Form(...), From: str = Form(...)):
                 correo = results[0]
                 print(f"⏳ Aprobado. Procesando envío a {correo['remitente']}...")
                 
-                # 1. Enviar el correo de verdad (Aquí es donde brillará la corrección)
+                # 1. Enviar el correo de verdad (usando Google Apps Script)
                 enviado = enviar_respuesta_smtp(correo["remitente"], correo["asunto"], correo["borrador_ia"])
                 
                 if enviado:
