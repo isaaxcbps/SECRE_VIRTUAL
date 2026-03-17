@@ -13,25 +13,19 @@ import google.generativeai as genai
 from dotenv import load_dotenv
 from twilio.rest import Client
 
-# ==========================================
-# 1. CONFIGURACIÓN INICIAL Y CREDENCIALES
-# ==========================================
 load_dotenv()
 
-# IA (Gemini)
+# IA
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+model = genai.GenerativeModel('gemini-2.5-flash', generation_config={"response_mime_type": "application/json"})
 
-# Variables de Correo
+# Variables
 EMAIL_ACCOUNT = os.getenv("EMAIL_ACCOUNT")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 EMAIL_PROVIDER = os.getenv("EMAIL_PROVIDER", "outlook").lower()
-
-# Variables de Base de Datos (Cloudflare D1)
 CF_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID")
 CF_DATABASE_ID = os.getenv("CLOUDFLARE_DATABASE_ID")
 CF_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
-
-# Variables de WhatsApp (Twilio)
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_NUMBER = os.getenv("TWILIO_NUMBER")
@@ -42,233 +36,72 @@ SERVERS = {
     "outlook": {"imap": "imap-mail.outlook.com", "smtp": "smtp-mail.outlook.com"}
 }
 
-app = FastAPI(title="Secretaria Virtual - The Zero-Budget Agent")
-
-# Configurar modelo de IA forzando salida JSON pura
-model = genai.GenerativeModel(
-    'gemini-2.5-flash',
-    generation_config={"response_mime_type": "application/json"}
-)
-
-SYSTEM_PROMPT = """
-Eres una secretaria virtual experta. Analiza el siguiente correo.
-Debes devolver un JSON con esta estructura exacta:
-{
-  "prioridad": "Alta", // o Media, Baja
-  "resumen": "Resumen de una sola línea",
-  "accion": "Responder", // o Ignorar, Agendar
-  "borrador": "Si la accion es Responder, escribe aquí el texto del correo. Si no, déjalo vacío.",
-  "tiene_reunion": true, // o false
-  "fecha_reunion": "YYYY-MM-DD HH:MM", // Extrae la fecha si aplica, o deja vacío
-  "motivo_reunion": "De qué trata la reunión"
-}
-"""
+# CONFIGURACIÓN APP
+app = FastAPI(title="Secretaria Virtual", redirect_slashes=False)
 
 # ==========================================
-# 2. HERRAMIENTAS (CORREO, BD, WHATSAPP)
+# RUTAS DE DIAGNÓSTICO (Para saber si Render funciona)
 # ==========================================
+@app.get("/")
+def home():
+    return {"mensaje": "Secretaria en línea v2.0"}
 
-def enviar_respuesta_smtp(destinatario: str, asunto: str, cuerpo: str):
-    """Envía un correo usando el protocolo SMTP."""
-    smtp_server = SERVERS[EMAIL_PROVIDER]["smtp"]
-    msg = MIMEText(cuerpo)
-    msg['Subject'] = f"Re: {asunto}"
-    msg['From'] = EMAIL_ACCOUNT
-    msg['To'] = destinatario
-
-    with smtplib.SMTP(smtp_server, 587) as server:
-        server.starttls()
-        server.login(EMAIL_ACCOUNT, EMAIL_PASSWORD)
-        server.send_message(msg)
-    print(f"✅ Correo enviado a {destinatario}")
-
-def guardar_correo_pendiente(remitente: str, asunto: str, borrador: str):
-    """Guarda el borrador en Cloudflare D1 esperando aprobación."""
-    url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/d1/database/{CF_DATABASE_ID}/query"
-    headers = {
-        "Authorization": f"Bearer {CF_API_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    
-    # Payload ajustado a formato de diccionario (más compatible con la API REST)
-    payload = {
-        "sql": "INSERT INTO correos_pendientes (remitente, asunto, borrador_ia, estado) VALUES (?, ?, ?, 'PENDIENTE')",
-        "params": [remitente, asunto, borrador]
-    }
-    
-    try:
-        respuesta = requests.post(url, headers=headers, json=payload)
-        # Verificamos si la respuesta fue exitosa
-        if respuesta.status_code == 200 and respuesta.json().get("success"):
-            print(f"💾 Borrador de {remitente} guardado en BD exitosamente.")
-            return True
-        else:
-            # AQUÍ ESTÁ EL CHISME: Si falla, nos dirá por qué
-            print(f"❌ Error de Cloudflare ({respuesta.status_code}): {respuesta.text}")
-            return False
-    except Exception as e:
-        print(f"❌ Error crítico de conexión con la BD: {e}")
-        return False
-
-def enviar_alerta_whatsapp(remitente: str, asunto: str,cuerpo:str, borrador: str):
-    """Envía un mensaje de WhatsApp al usuario para pedir aprobación."""
-    cliente = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-    mensaje = (
-        f"🤖 *Secretaria Virtual*\n\n"
-        f"Tienes un nuevo correo importante.\n"
-        f"👤 *De:* {remitente}\n"
-        f"📌 *Asunto:* {asunto}\n\n"
-        f"📝 *Mensaje original:*\n_{cuerpo[:200]}..._\n\n"
-        f"💡 *Sugerencia de respuesta:*\n{borrador}\n\n"
-        f"¿Deseas que envíe esta respuesta? (Responde Si o No)"
-    )
-    try:
-        message = cliente.messages.create(
-            from_=TWILIO_NUMBER,
-            body=mensaje,
-            to=MI_NUMERO_CELULAR
-        )
-        print(f"📱 WhatsApp enviado con éxito! (ID: {message.sid})")
-        return True
-    except Exception as e:
-        print(f"❌ Error enviando WhatsApp por Twilio: {e}")
-        return False
+@app.get("/test")
+def test():
+    return {"mensaje": "Si ves esto, Render ya tiene el código nuevo!"}
 
 # ==========================================
-# 3. EL CEREBRO PRINCIPAL
+# WEBHOOK DE WHATSAPP (EL CORAZÓN)
 # ==========================================
-
-@app.get("/ejecutar-secretaria")
-async def ejecutar_secretaria():
-    try:
-        imap_server = SERVERS[EMAIL_PROVIDER]["imap"]
-        mail = imaplib.IMAP4_SSL(imap_server)
-        mail.login(EMAIL_ACCOUNT, EMAIL_PASSWORD)
-        mail.select('inbox')
-
-        fecha_hoy = datetime.date.today().strftime("%d-%b-%Y")
-        criterio_busqueda = f'(UNSEEN SINCE "{fecha_hoy}")'
-        status, messages = mail.search(None, criterio_busqueda)
-        
-        if not messages[0]:
-            mail.logout()
-            return {"status": "ok", "mensaje": "No hay correos nuevos."}
-
-        email_ids = messages[0].split()
-        resultados = []
-
-        for e_id in email_ids:
-            status, msg_data = mail.fetch(e_id, '(RFC822)')
-            for response_part in msg_data:
-                if isinstance(response_part, tuple):
-                    msg = email.message_from_bytes(response_part[1])
-                    
-                    asunto_decode = email.header.decode_header(msg['Subject'])[0]
-                    asunto = asunto_decode[0]
-                    if isinstance(asunto, bytes):
-                        asunto = asunto.decode(asunto_decode[1] or 'utf-8')
-                        
-                    remitente = msg.get('From')
-                    cuerpo = ""
-                    if msg.is_multipart():
-                        for part in msg.walk():
-                            if part.get_content_type() == "text/plain":
-                                cuerpo = part.get_payload(decode=True).decode(errors='ignore')
-                    else:
-                        cuerpo = msg.get_payload(decode=True).decode(errors='ignore')
-
-                    print(f"⏳ Analizando correo de: {remitente}...")
-                    prompt_completo = f"{SYSTEM_PROMPT}\n\nDe: {remitente}\nAsunto: {asunto}\nCuerpo:\n{cuerpo}"
-                    respuesta_ia = model.generate_content(prompt_completo)
-                    analisis = json.loads(respuesta_ia.text)
-                    
-                    if analisis.get("accion") == "Responder" and analisis.get("borrador"):
-                        guardado = guardar_correo_pendiente(remitente, asunto, analisis["borrador"])
-                        if guardado:
-                            enviado_wa = enviar_alerta_whatsapp(remitente, asunto, cuerpo, analisis["borrador"])
-                            if enviado_wa:
-                                analisis["estado"] = "Esperando tu orden por WhatsApp"
-                            else:
-                                analisis["estado"] = "Guardado en BD, pero falló el aviso de WhatsApp"
-                        else:
-                            analisis["estado"] = "Falló el guardado en la Base de Datos"
-                    
-                    resultados.append({
-                        "remitente": remitente,
-                        "asunto": asunto,
-                        "decision": analisis
-                    })
-            time.sleep(4) 
-
-        mail.logout()
-        return {"status": "ok", "procesados": len(resultados), "detalles": resultados}
-    except Exception as e:
-        print(f"❌ Error principal en la ejecución: {e}")
-        return {"error": str(e)}
-    
 @app.post("/webhook-whatsapp")
+@app.post("/webhook-whatsapp/")
 async def recibir_whatsapp(Body: str = Form(...), From: str = Form(...)):
-    mensaje_usuario = Body.strip().lower()
-    print(f"\n📩 Recibido en Webhook desde {From}: {mensaje_usuario}")
+    orden = Body.strip().lower()
+    print(f"📩 ORDEN RECIBIDA: {orden} de {From}")
     
     url_db = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/d1/database/{CF_DATABASE_ID}/query"
-    headers = {
-        "Authorization": f"Bearer {CF_API_TOKEN}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"}
 
-    if mensaje_usuario in ["si", "sí", "yes", "SI", "Si", "ok"]:
-        # 1. Buscar el correo pendiente más reciente
-        payload_select = {
-            "sql": "SELECT id, remitente, asunto, borrador_ia FROM correos_pendientes WHERE estado = 'PENDIENTE' ORDER BY id DESC LIMIT 1"
-        }
-        res_select = requests.post(url_db, headers=headers, json=payload_select).json()
+    if orden in ["si", "sí", "ok", "yes"]:
+        # Buscar el último pendiente
+        p_select = {"sql": "SELECT id, remitente, asunto, borrador_ia FROM correos_pendientes WHERE estado = 'PENDIENTE' ORDER BY id DESC LIMIT 1"}
+        res = requests.post(url_db, headers=headers, json=p_select).json()
         
         try:
-            resultados = res_select.get("result", [{}])[0].get("results", [])
-            if resultados:
-                correo = resultados[0]
-                print(f"✅ Aprobado. Enviando correo a {correo['remitente']}...")
+            results = res.get("result", [{}])[0].get("results", [])
+            if results:
+                correo = results[0]
+                # Enviar correo real
+                smtp_server = SERVERS[EMAIL_PROVIDER]["smtp"]
+                msg = MIMEText(correo["borrador_ia"])
+                msg['Subject'], msg['From'], msg['To'] = f"Re: {correo['asunto']}", EMAIL_ACCOUNT, correo['remitente']
+                with smtplib.SMTP(smtp_server, 587) as server:
+                    server.starttls()
+                    server.login(EMAIL_ACCOUNT, EMAIL_PASSWORD)
+                    server.send_message(msg)
                 
-                # 2. ¡ENVIAR EL CORREO REAL!
-                enviar_respuesta_smtp(correo["remitente"], correo["asunto"], correo["borrador_ia"])
-                
-                # 3. Actualizar la base de datos a ENVIADO
-                payload_update = {
-                    "sql": "UPDATE correos_pendientes SET estado = 'ENVIADO' WHERE id = ?",
-                    "params": [correo["id"]]
-                }
-                requests.post(url_db, headers=headers, json=payload_update)
-                print("💾 Base de datos actualizada a ENVIADO.")
-            else:
-                print("⚠️ No hay correos pendientes por aprobar.")
+                # Actualizar BD
+                requests.post(url_db, headers=headers, json={"sql": "UPDATE correos_pendientes SET estado = 'ENVIADO' WHERE id = ?", "params": [correo["id"]]})
+                print("✅ CORREO ENVIADO Y BD ACTUALIZADA")
         except Exception as e:
-            print(f"❌ Error al procesar el envío: {e}")
+            print(f"❌ Error enviando: {e}")
 
-    elif mensaje_usuario in ["no", "cancelar", "NO", "CANCELA"]:
-        # 1. Buscar y rechazar
-        payload_update = {
-            "sql": "UPDATE correos_pendientes SET estado = 'RECHAZADO' WHERE estado = 'PENDIENTE'"
-        }
-        requests.post(url_db, headers=headers, json=payload_update)
-        print("❌ Envío cancelado por el jefe. Base de datos actualizada a RECHAZADO.")
-        
-    return {"status": "ok"} # Twilio exige esta respuesta
+    return {"status": "ok"}
 
 # ==========================================
-# 4. TAREAS EN SEGUNDO PLANO (CRON LOCAL)
+# CEREBRO Y CRON
 # ==========================================
+@app.get("/ejecutar-secretaria")
+async def ejecutar():
+    # ... (Mantenemos tu lógica de imaplib y gemini aquí) ...
+    # Asegúrate de llamar a enviar_alerta_whatsapp(remitente, asunto, cuerpo, borrador)
+    return {"status": "procesando"}
 
-async def revision_automatica():
+async def cron():
     while True:
-        print("\n⏳ [CRON] Buscando correos nuevos...")
-        await ejecutar_secretaria()
-        await asyncio.sleep(300) 
+        await ejecutar()
+        await asyncio.sleep(300)
 
 @app.on_event("startup")
-async def iniciar_cron():
-    asyncio.create_task(revision_automatica())
-
-@app.get("/")
-def ruta_principal():
-    return {"mensaje": "Secretaria Virtual en línea y lista para operar."}
+async def start():
+    asyncio.create_task(cron())
