@@ -21,7 +21,7 @@ load_dotenv()
 # IA (Gemini)
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 model = genai.GenerativeModel(
-    'gemini-2.0-flash', # O la versión que estés usando
+    'gemini-2.5-flash', # O la versión que estés usando
     generation_config={"response_mime_type": "application/json"}
 )
 
