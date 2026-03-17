@@ -8,7 +8,7 @@ import time
 import requests
 import asyncio
 from email.mime.text import MIMEText
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Form 
 import google.generativeai as genai
 from dotenv import load_dotenv
 from twilio.rest import Client
@@ -110,7 +110,7 @@ def guardar_correo_pendiente(remitente: str, asunto: str, borrador: str):
         print(f"❌ Error crítico de conexión con la BD: {e}")
         return False
 
-def enviar_alerta_whatsapp(remitente: str, asunto: str, borrador: str):
+def enviar_alerta_whatsapp(remitente: str, asunto: str,cuerpo:str, borrador: str):
     """Envía un mensaje de WhatsApp al usuario para pedir aprobación."""
     cliente = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
     mensaje = (
@@ -118,8 +118,9 @@ def enviar_alerta_whatsapp(remitente: str, asunto: str, borrador: str):
         f"Tienes un nuevo correo importante.\n"
         f"👤 *De:* {remitente}\n"
         f"📌 *Asunto:* {asunto}\n\n"
+        f"📝 *Mensaje original:*\n_{cuerpo[:200]}..._\n\n"
         f"💡 *Sugerencia de respuesta:*\n{borrador}\n\n"
-        f"¿Deseas que envíe esta respuesta? (Responde SÍ o NO)"
+        f"¿Deseas que envíe esta respuesta? (Responde Si o No)"
     )
     try:
         message = cliente.messages.create(
@@ -184,7 +185,7 @@ async def ejecutar_secretaria():
                     if analisis.get("accion") == "Responder" and analisis.get("borrador"):
                         guardado = guardar_correo_pendiente(remitente, asunto, analisis["borrador"])
                         if guardado:
-                            enviado_wa = enviar_alerta_whatsapp(remitente, asunto, analisis["borrador"])
+                            enviado_wa = enviar_alerta_whatsapp(remitente, asunto, cuerpo, analisis["borrador"])
                             if enviado_wa:
                                 analisis["estado"] = "Esperando tu orden por WhatsApp"
                             else:
@@ -204,6 +205,55 @@ async def ejecutar_secretaria():
     except Exception as e:
         print(f"❌ Error principal en la ejecución: {e}")
         return {"error": str(e)}
+    
+@app.post("/webhook-whatsapp")
+async def recibir_whatsapp(Body: str = Form(...), From: str = Form(...)):
+    mensaje_usuario = Body.strip().lower()
+    print(f"\n📩 Recibido en Webhook desde {From}: {mensaje_usuario}")
+    
+    url_db = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/d1/database/{CF_DATABASE_ID}/query"
+    headers = {
+        "Authorization": f"Bearer {CF_API_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    if mensaje_usuario in ["si", "sí", "yes", "SI", "Si", "ok"]:
+        # 1. Buscar el correo pendiente más reciente
+        payload_select = {
+            "sql": "SELECT id, remitente, asunto, borrador_ia FROM correos_pendientes WHERE estado = 'PENDIENTE' ORDER BY id DESC LIMIT 1"
+        }
+        res_select = requests.post(url_db, headers=headers, json=payload_select).json()
+        
+        try:
+            resultados = res_select.get("result", [{}])[0].get("results", [])
+            if resultados:
+                correo = resultados[0]
+                print(f"✅ Aprobado. Enviando correo a {correo['remitente']}...")
+                
+                # 2. ¡ENVIAR EL CORREO REAL!
+                enviar_respuesta_smtp(correo["remitente"], correo["asunto"], correo["borrador_ia"])
+                
+                # 3. Actualizar la base de datos a ENVIADO
+                payload_update = {
+                    "sql": "UPDATE correos_pendientes SET estado = 'ENVIADO' WHERE id = ?",
+                    "params": [correo["id"]]
+                }
+                requests.post(url_db, headers=headers, json=payload_update)
+                print("💾 Base de datos actualizada a ENVIADO.")
+            else:
+                print("⚠️ No hay correos pendientes por aprobar.")
+        except Exception as e:
+            print(f"❌ Error al procesar el envío: {e}")
+
+    elif mensaje_usuario in ["no", "cancelar", "NO", "CANCELA"]:
+        # 1. Buscar y rechazar
+        payload_update = {
+            "sql": "UPDATE correos_pendientes SET estado = 'RECHAZADO' WHERE estado = 'PENDIENTE'"
+        }
+        requests.post(url_db, headers=headers, json=payload_update)
+        print("❌ Envío cancelado por el jefe. Base de datos actualizada a RECHAZADO.")
+        
+    return {"status": "ok"} # Twilio exige esta respuesta
 
 # ==========================================
 # 4. TAREAS EN SEGUNDO PLANO (CRON LOCAL)
