@@ -105,11 +105,15 @@ def guardar_correo_pendiente(remitente: str, asunto: str, borrador: str):
 def enviar_alerta_whatsapp(remitente: str, asunto: str, cuerpo: str, borrador: str):
     """Envía la notificación con el cuerpo del mensaje original."""
     cliente = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    
+    # Limpiamos el cuerpo por si acaso trae etiquetas HTML basura
+    cuerpo_limpio = cuerpo[:200].replace('\n', ' ').strip()
+    
     mensaje = (
         f"🤖 *Secretaria Virtual*\n\n"
         f"👤 *De:* {remitente}\n"
         f"📌 *Asunto:* {asunto}\n"
-        f"📝 *Original:* _{cuerpo[:150]}..._\n\n"
+        f"📝 *Original:* _{cuerpo_limpio}..._\n\n"
         f"💡 *Sugerencia:*\n{borrador}\n\n"
         f"¿Enviar respuesta? (Responde SI o NO)"
     )
@@ -168,7 +172,7 @@ async def recibir_whatsapp(Body: str = Form(...), From: str = Form(...)):
 
 @app.get("/ejecutar-secretaria")
 async def ejecutar_secretaria():
-    """Busca correos nuevos y manda el aviso al cel (Versión con Logs Detallados)."""
+    """Busca correos nuevos y manda el aviso al cel (Versión con Logs Detallados y HTML)."""
     try:
         print("\n=======================================")
         print("🕵️ INICIANDO BÚSQUEDA DE CORREOS...")
@@ -197,7 +201,7 @@ async def ejecutar_secretaria():
             _, data = mail.fetch(e_id, '(RFC822)')
             msg = email.message_from_bytes(data[0][1])
             
-            # Decodificar el asunto de forma segura
+            # 1. DECODIFICAR EL ASUNTO
             asunto_decode = email.header.decode_header(msg['Subject'])[0]
             asunto = asunto_decode[0]
             if isinstance(asunto, bytes): 
@@ -206,17 +210,32 @@ async def ejecutar_secretaria():
                 except:
                     asunto = asunto.decode('utf-8', errors='ignore')
                     
-            remitente = msg.get('From')
+            # 2. DECODIFICAR EL REMITENTE (Para quitar el UTF-8 raro)
+            remitente_bruto = msg.get('From')
+            remitente_decode = email.header.decode_header(remitente_bruto)[0]
+            remitente = remitente_decode[0]
+            if isinstance(remitente, bytes):
+                try:
+                    remitente = remitente.decode(remitente_decode[1] or 'utf-8')
+                except:
+                    remitente = remitente.decode('utf-8', errors='ignore')
+
             print(f"\n📨 Analizando correo de: {remitente}")
             print(f"📌 Asunto: {asunto}")
             
+            # 3. EXTRAER EL CUERPO (A PRUEBA DE HTML)
             cuerpo = ""
             if msg.is_multipart():
                 for part in msg.walk():
-                    if part.get_content_type() == "text/plain":
-                        cuerpo = part.get_payload(decode=True).decode(errors='ignore')
+                    content_type = part.get_content_type()
+                    if content_type == "text/plain":
+                        cuerpo = part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                        break 
+                    elif content_type == "text/html" and not cuerpo:
+                        # Si no hay texto plano, nos conformamos con el HTML
+                        cuerpo = part.get_payload(decode=True).decode('utf-8', errors='ignore')
             else:
-                cuerpo = msg.get_payload(decode=True).decode(errors='ignore')
+                cuerpo = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
 
             prompt = f"{SYSTEM_PROMPT}\n\nDe: {remitente}\nAsunto: {asunto}\nCuerpo:\n{cuerpo}"
             raw_ia = model.generate_content(prompt)
