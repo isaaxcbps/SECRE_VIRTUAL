@@ -35,10 +35,10 @@ TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_NUMBER = os.getenv("TWILIO_NUMBER")
 MI_NUMERO_CELULAR = os.getenv("MI_NUMERO_CELULAR")
 
-# 🚨 NUEVA LLAVE PARA EL PUENTE DE GOOGLE
+# Llave para el puente de Google Apps Script
 GOOGLE_SCRIPT_URL = os.getenv("GOOGLE_SCRIPT_URL")
 
-# Servidores IMAP (Solo para LEER los correos, ya no usamos SMTP aquí)
+# Servidores IMAP (Solo para LEER los correos)
 SERVERS = {
     "gmail": {"imap": "imap.gmail.com"},
     "outlook": {"imap": "outlook.office365.com"}
@@ -78,7 +78,6 @@ def enviar_respuesta_smtp(destinatario: str, asunto: str, cuerpo: str):
             "cuerpo": cuerpo
         }
         
-        # Enviamos los datos por el puerto 443 (HTTP) que Render SÍ permite
         res = requests.post(GOOGLE_SCRIPT_URL, json=payload)
         
         if res.status_code == 200:
@@ -123,7 +122,7 @@ def enviar_alerta_whatsapp(remitente: str, asunto: str, cuerpo: str, borrador: s
         return False
 
 # ==========================================
-# 3. ENDPOINTS (EL CEREBRO)
+# 3. ENDPOINTS (EL CEREBRO CHISMOSO)
 # ==========================================
 
 @app.get("/")
@@ -154,11 +153,9 @@ async def recibir_whatsapp(Body: str = Form(...), From: str = Form(...)):
                 correo = results[0]
                 print(f"⏳ Aprobado. Procesando envío a {correo['remitente']}...")
                 
-                # 1. Enviar el correo de verdad (usando Google Apps Script)
                 enviado = enviar_respuesta_smtp(correo["remitente"], correo["asunto"], correo["borrador_ia"])
                 
                 if enviado:
-                    # 2. Marcar como enviado en BD
                     p_update = {"sql": "UPDATE correos_pendientes SET estado = 'ENVIADO' WHERE id = ?", "params": [correo["id"]]}
                     requests.post(url_db, headers=headers, json=p_update)
                     print("💾 Base de datos actualizada a ENVIADO.")
@@ -171,26 +168,47 @@ async def recibir_whatsapp(Body: str = Form(...), From: str = Form(...)):
 
 @app.get("/ejecutar-secretaria")
 async def ejecutar_secretaria():
-    """Busca correos nuevos y manda el aviso al cel."""
+    """Busca correos nuevos y manda el aviso al cel (Versión con Logs Detallados)."""
     try:
+        print("\n=======================================")
+        print("🕵️ INICIANDO BÚSQUEDA DE CORREOS...")
+        
         imap_server = SERVERS[EMAIL_PROVIDER]["imap"]
         mail = imaplib.IMAP4_SSL(imap_server)
         mail.login(EMAIL_ACCOUNT, EMAIL_PASSWORD)
         mail.select('inbox')
 
-        fecha = datetime.date.today().strftime("%d-%b-%Y")
-        _, messages = mail.search(None, f'(UNSEEN SINCE "{fecha}")')
+        # Usamos la fecha de ayer por si acaso hay problemas de zona horaria
+        ayer = datetime.date.today() - datetime.timedelta(days=1)
+        fecha = ayer.strftime("%d-%b-%Y")
+        
+        print(f"📅 Buscando correos NO LEÍDOS desde el {fecha}...")
+        status, messages = mail.search(None, f'(UNSEEN SINCE "{fecha}")')
         
         if not messages[0]:
+            print("📭 Bandeja limpia. No hay correos no leídos que coincidan.")
             mail.logout()
             return {"status": "sin correos"}
 
-        for e_id in messages[0].split():
+        email_ids = messages[0].split()
+        print(f"📬 ¡Bingo! Encontrados {len(email_ids)} correos pendientes.")
+
+        for e_id in email_ids:
             _, data = mail.fetch(e_id, '(RFC822)')
             msg = email.message_from_bytes(data[0][1])
-            asunto = email.header.decode_header(msg['Subject'])[0][0]
-            if isinstance(asunto, bytes): asunto = asunto.decode()
+            
+            # Decodificar el asunto de forma segura
+            asunto_decode = email.header.decode_header(msg['Subject'])[0]
+            asunto = asunto_decode[0]
+            if isinstance(asunto, bytes): 
+                try:
+                    asunto = asunto.decode(asunto_decode[1] or 'utf-8')
+                except:
+                    asunto = asunto.decode('utf-8', errors='ignore')
+                    
             remitente = msg.get('From')
+            print(f"\n📨 Analizando correo de: {remitente}")
+            print(f"📌 Asunto: {asunto}")
             
             cuerpo = ""
             if msg.is_multipart():
@@ -202,15 +220,30 @@ async def ejecutar_secretaria():
 
             prompt = f"{SYSTEM_PROMPT}\n\nDe: {remitente}\nAsunto: {asunto}\nCuerpo:\n{cuerpo}"
             raw_ia = model.generate_content(prompt)
-            analisis = json.loads(raw_ia.text)
             
-            if analisis.get("accion") == "Responder":
-                if guardar_correo_pendiente(remitente, asunto, analisis["borrador"]):
-                    enviar_alerta_whatsapp(remitente, asunto, cuerpo, analisis["borrador"])
+            try:
+                analisis = json.loads(raw_ia.text)
+                decision = analisis.get("accion")
+                print(f"🧠 Decisión de la IA: {decision} | Resumen: {analisis.get('resumen')}")
+                
+                if decision == "Responder":
+                    guardado = guardar_correo_pendiente(remitente, asunto, analisis["borrador"])
+                    if guardado:
+                        print("💾 Guardado en Cloudflare D1. Avisando por WhatsApp...")
+                        enviar_alerta_whatsapp(remitente, asunto, cuerpo, analisis["borrador"])
+                    else:
+                        print("❌ FALLA: No se pudo guardar en la base de datos.")
+                else:
+                    print("⏭️ La IA decidió no responder a este correo.")
+            except Exception as e:
+                print(f"❌ Error leyendo el JSON de la IA: {raw_ia.text} | Error: {e}")
             
         mail.logout()
-        return {"status": "terminado"}
+        print("=======================================\n")
+        return {"status": "terminado", "procesados": len(email_ids)}
+        
     except Exception as e:
+        print(f"🚨 ERROR CRÍTICO EN EL MOTOR DE CORREO: {e}")
         return {"error": str(e)}
 
 # ==========================================
@@ -220,7 +253,6 @@ async def ejecutar_secretaria():
 async def revision_automatica():
     while True:
         await asyncio.sleep(300) # Espera inicial
-        print("\n⏳ [CRON] Revisando correos...")
         await ejecutar_secretaria()
 
 @app.on_event("startup")
